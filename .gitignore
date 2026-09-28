@@ -1,0 +1,22 @@
+# ---- Phoenix backup output (never commit user data) ----
+Phoenix-Backup-*/
+backup/
+secure/
+*.enc
+*.ubundle
+manifest.json
+
+# ---- Exported artifacts ----
+my-apps.json
+*.pow
+*.reg
+
+# ---- OS / editor noise ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.vs/
+.vscode/
+*.log
+*.tmp
