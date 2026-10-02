@@ -32,11 +32,12 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 - 🧠 **Smart mode** copies app configs but skips caches, chat history and other regenerated junk (keeps a VS Code backup at ~1 MB instead of gigabytes).
 - 🧾 **`manifest.json` + `checksums.sha256` + `phoenix.log`** — every item, its size, status and hash. **Verify** re-hashes the backup any time.
 - 🔍 **Dry run** — shows exactly what restore would install, overwrite or skip on *this* PC before touching anything.
+- 🔀 **Compare** — diff any two backups (modules, files, installed apps, extensions, globals, env vars), and every backup automatically reports **what changed since the last one** in `compare.txt`.
 - 🛟 **Creates a System Restore Point** before writing any Windows settings on restore, and ends with a per-item **report** (done / skipped / needs manual action).
 - ♻️ **Auto-reinstalls** apps, editor extensions, language globals (npm / pip / cargo / dotnet / PowerShell modules) and even **WSL distros** on the new PC.
 - ⏰ **Scheduled backups** — one click creates a Windows task that runs Phoenix headless and mirror-updates the existing backup.
 - 🖥️ **Responsive UI** — work runs on a background runspace, so the window never freezes; live log + progress.
-- 📦 **Zero dependencies** — runs on the Windows PowerShell 5.1 that ships with every Windows 10/11.
+- 📦 **Zero dependencies** — runs on the Windows PowerShell 5.1 that ships with every Windows 10/11. Ships as a folder *or* a single portable **`Phoenix.exe`**.
 
 ---
 
@@ -51,8 +52,8 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 
 ## Quick start
 
-1. Download this repo (or copy the `Phoenix` folder) onto a **USB stick, external drive, or cloud folder** — somewhere that survives the wipe.
-2. Double-click **`Phoenix.cmd`**. (It launches PowerShell in the STA mode WPF needs; you never touch a console.)
+1. Grab **`Phoenix.exe`** from [Releases](https://github.com/abdellaziz-ali/Phoenix/releases) *or* download this repo, and put it on a **USB stick, external drive, or cloud folder** — somewhere that survives the wipe.
+2. Double-click **`Phoenix.exe`** (or **`Phoenix.cmd`** if you use the folder). No install, no console window.
 
 ### Back up (before wiping)
 
@@ -64,10 +65,10 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 
 ### Restore (on the fresh install)
 
-1. Copy the `Phoenix` folder back and run **`Phoenix.cmd`** (right-click → **Run as administrator** for a complete restore).
+1. Copy Phoenix back and run it (right-click → **Run as administrator** for a complete restore).
 2. **Restore** tab → **Open backup** → select your `Phoenix-Backup-…` folder.
 3. Phoenix reads the manifest and shows what's inside. Untick anything you don't want. Enter the vault password if you encrypted.
-4. **Verify** to make sure the backup is intact, then **Dry run** to see what would change on this PC.
+4. **Verify** to make sure the backup is intact, then **Dry run** to see what would change on this PC. **Compare** shows what differs from another backup.
 5. **Start restore.** It creates a restore point, reinstalls apps, puts your settings and files back, and shows a report of anything that needs a manual step.
 
 > Sign out / restart afterwards so Explorer, environment variables and Windows Terminal pick up the changes.
@@ -80,7 +81,7 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 | --- | --- |
 | **Applications** | Installed apps (winget export/import) · UniGetUI `.ubundle` · full **installed-programs inventory** (Add/Remove Programs, incl. non-winget) as a reinstall checklist |
 | **Developer environment** | VS Code / Insiders / Cursor extensions · global npm packages (+ nvm/fnm) · pip freeze per Python · Rust toolchains & cargo crates · dotnet global tools · Git config (credentials 🔒) · **SSH keys** 🔒 · PowerShell profile & modules · WSL distro list · **WSL full export/import** (`wsl --export`) · user environment variables (incl. PATH) |
-| **Windows settings** | **Wi‑Fi profiles + passwords** 🔒 · power plans · **network adapter driver settings** (Speed & Duplex, Jumbo Packet, Wake‑on‑LAN, RSS…) · mapped drives · hosts file · scheduled tasks (with folders) · Explorer/taskbar tweaks · Windows Terminal (Store *and* unpackaged) · printers · default app associations · user-installed fonts (copied *and* registered) |
+| **Windows settings** | **Wi‑Fi profiles + passwords** 🔒 · power plans · **network adapter driver settings** (Speed & Duplex, Jumbo Packet, Wake‑on‑LAN, RSS…) · **static IP / DNS per adapter** (IPv4 + IPv6 addresses, gateways, DNS servers, suffix; DHCP adapters left alone) · mapped drives · hosts file · scheduled tasks (with folders) · Explorer/taskbar tweaks · Windows Terminal (Store *and* unpackaged) · printers · default app associations · user-installed fonts (copied *and* registered) |
 | **App settings & data** | App configs (Smart, caches skipped — pick which apps) · **browser bookmarks** (Chrome, Edge, Brave, Vivaldi, Firefox) · **full browser profiles** 🔒 · **PuTTY sessions** 🔒 |
 | **User folders** | Documents · Desktop · Pictures · Downloads · Videos · Music · **any custom folders** you add (game saves, notes vault, projects…) |
 
@@ -102,6 +103,7 @@ Most items work as a normal user. Run **as administrator** for:
 
 - Wi‑Fi profile import (`user=all`)
 - Network adapter driver settings (`Set-NetAdapterAdvancedProperty`)
+- Static IP / DNS configuration (`New-NetIPAddress`, `Set-DnsClientServerAddress`)
 - Scheduled task registration
 - Default app associations export/import
 - Writing the `hosts` file
@@ -113,20 +115,22 @@ The title bar shows an **Administrator** badge, or a **Run as admin** button to 
 
 ## How it works
 
-- **One file, one window.** `Phoenix.ps1` builds a WPF UI from embedded XAML and drives everything; `Phoenix.cmd` just launches it with `-STA`.
+- **One file, one window.** `Phoenix.ps1` builds a WPF UI from embedded XAML and drives everything; `Phoenix.cmd` just launches it with `-STA`. `Phoenix.exe` is a tiny native stub that embeds the script, extracts it to `%LOCALAPPDATA%\Phoenix\app\<hash>\` and launches it the same way — build it yourself with `.\Build-Exe.ps1` (uses the C# compiler that ships with Windows, nothing to install).
 - **Non-blocking.** Backups/restores run in a background PowerShell runspace that pushes log + progress events onto a synchronized queue; a `DispatcherTimer` drains them into the UI, so the window stays responsive.
 - **Data model.** Modules are declarative metadata (id, category, sensitivity, presets). The worker maps each id to a backup/restore/estimate action, so adding a module is a small, isolated change.
 - **Copies.** Folders are mirrored with `robocopy`; Smart mode adds `/XD` excludes for caches, `workspaceStorage`, `globalStorage`, `History`, and similar regenerated data.
 - **Manifest.** Every backup writes `manifest.json` (tool version, machine, per-module status/size/notes, vault flag) that the Restore tab reads back.
+- **Compare.** Diffs two backups on three levels: module status/size from the manifests, files via `checksums.sha256` grouped per module, and the package/extension/env lists themselves. After each backup it runs automatically against the previous one in the same destination (a mirror update snapshots the old manifest and lists first) and writes `compare.txt`.
 
 ```text
 Phoenix-Backup-<PC>-<timestamp>/
 ├─ manifest.json
 ├─ checksums.sha256   SHA-256 of every file (used by Verify)
 ├─ phoenix.log        full log of the run
+├─ compare.txt        what changed since the previous backup
 ├─ apps/              winget-packages.json, apps.ubundle, installed-programs.csv
 ├─ dev/               extensions, npm/pip/cargo/dotnet lists, git, env, ssh, wsl/*.tar…
-├─ windows/           wifi, power, netadapters.json, hosts, tasks, terminal, explorer.reg…
+├─ windows/           wifi, power, netadapters.json, netip.json, hosts, tasks, terminal, explorer.reg…
 ├─ appdata/           per-app Smart configs, browsers/bookmarks, browsers/profiles
 ├─ userfolders/       Documents, Desktop, …, custom/
 └─ secure/vault.enc   (encrypted sensitive bundle)
@@ -143,14 +147,17 @@ Phoenix-Backup-<PC>-<timestamp>/
 - [x] Restore "dry run" diff against the current PC
 - [x] Backup verification (checksums + vault integrity)
 - [x] Network adapter driver settings
-- [ ] Static IP / DNS configuration per adapter
-- [ ] Compare two backups (what changed since last run)
-- [ ] Portable single `.exe` wrapper
+- [x] Static IP / DNS configuration per adapter
+- [x] Compare two backups (what changed since last run)
+- [x] Portable single `.exe` wrapper
+- [ ] Restore from a backup made on a different user account (path remapping)
+- [ ] Delta backups (only copy files that changed since last run)
 
 ## Contributing
 
 Issues and PRs are welcome. Because it's a single script, keep changes small and test with the
-built-in validation hooks (parse check + headless window build) before opening a PR.
+built-in validation hooks (parse check + headless window build) before opening a PR. To ship a
+binary, run `.\Build-Exe.ps1` and attach `dist\Phoenix.exe` to the release — the exe is not committed.
 
 ## License
 

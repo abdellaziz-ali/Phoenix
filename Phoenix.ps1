@@ -47,6 +47,7 @@ $Script:Modules = @(
     @{ Id='win_wifi';      Cat='Windows Settings'; Name='Wi-Fi profiles';               Desc='Saved networks with passwords.';                                   Sensitive=$true;  Admin=$false; Presets=@('Minimal','Developer') }
     @{ Id='win_power';     Cat='Windows Settings'; Name='Power plans';                  Desc='Exports custom power schemes.';                                    Sensitive=$false; Admin=$false; Presets=@('Developer') }
     @{ Id='win_netadapter';Cat='Windows Settings'; Name='Network adapter settings';     Desc='Driver properties per NIC: Speed & Duplex, Jumbo Packet, Wake-on-LAN, RSS, offloads... Matched by MAC on restore (needs admin).'; Sensitive=$false; Admin=$true; Presets=@('Developer') }
+    @{ Id='win_netip';     Cat='Windows Settings'; Name='Static IP & DNS';               Desc='Manual IPv4/IPv6 addresses, gateways, DNS servers and suffix per adapter. DHCP adapters are recorded but left alone. Matched by MAC on restore (needs admin).'; Sensitive=$false; Admin=$true; Presets=@('Developer') }
     @{ Id='win_drives';    Cat='Windows Settings'; Name='Mapped network drives';        Desc='SMB drive mappings.';                                              Sensitive=$false; Admin=$false; Presets=@('Developer') }
     @{ Id='win_hosts';     Cat='Windows Settings'; Name='Hosts file';                   Desc='C:\Windows\System32\drivers\etc\hosts.';                           Sensitive=$false; Admin=$false; Presets=@('Developer') }
     @{ Id='win_tasks';     Cat='Windows Settings'; Name='Scheduled tasks';              Desc='Your non-system scheduled tasks.';                                 Sensitive=$false; Admin=$false; Presets=@() }
@@ -315,6 +316,49 @@ function Plan-NetAdapter($jsonPath){
     $plan
 }
 
+# Live IP state for one adapter + family. DnsStatic comes from the registry NameServer value, which is the only reliable "DNS was set by hand" signal.
+function Get-NetIPState($nic,$fam){
+    $if=Get-NetIPInterface -InterfaceIndex $nic.InterfaceIndex -AddressFamily $fam -ErrorAction SilentlyContinue | Select-Object -First 1
+    if(-not $if){ return $null }
+    $addrs=@(Get-NetIPAddress -InterfaceIndex $nic.InterfaceIndex -AddressFamily $fam -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' } | ForEach-Object { "{0}/{1}" -f $_.IPAddress,$_.PrefixLength } | Sort-Object)
+    $gws=@(Get-NetRoute -InterfaceIndex $nic.InterfaceIndex -AddressFamily $fam -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' -or $_.DestinationPrefix -eq '::/0' } | ForEach-Object { $_.NextHop } | Sort-Object -Unique)
+    $dns=@((Get-DnsClientServerAddress -InterfaceIndex $nic.InterfaceIndex -AddressFamily $fam -ErrorAction SilentlyContinue).ServerAddresses | Where-Object { $_ })
+    $svc = if($fam -eq 'IPv4'){ 'Tcpip' } else { 'Tcpip6' }
+    $ns = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$svc\Parameters\Interfaces\$($nic.InterfaceGuid)" -ErrorAction SilentlyContinue).NameServer
+    @{ Family=$fam; Dhcp=($if.Dhcp -eq 'Enabled'); Addresses=$addrs; Gateways=$gws; Dns=$dns; DnsStatic=[bool]$ns }
+}
+# Matches saved adapters (MAC, then description) and lists the static IP / DNS settings that differ. DHCP families are counted, never changed.
+function Plan-NetIP($jsonPath){
+    $saved=@(Get-Content $jsonPath -Raw | ConvertFrom-Json)
+    $cur=@(Get-NetAdapter -Physical -ErrorAction SilentlyContinue)
+    $plan=@{ Changes=@(); Unmatched=@(); Matched=0; Same=0; Dhcp=0 }
+    foreach($s in $saved){
+        $nic = $cur | Where-Object { $_.MacAddress -eq $s.Mac } | Select-Object -First 1
+        if(-not $nic){ $nic = $cur | Where-Object { $_.InterfaceDescription -eq $s.Description } | Select-Object -First 1 }
+        if(-not $nic){ $plan.Unmatched += $s.Name; continue }
+        $plan.Matched++
+        foreach($f in @($s.Families)){
+            $have=Get-NetIPState $nic $f.Family; if(-not $have){ continue }
+            $sAddr=@($f.Addresses | Where-Object { $_ } | Sort-Object); $sGw=@($f.Gateways | Where-Object { $_ } | Sort-Object -Unique); $sDns=@($f.Dns | Where-Object { $_ })
+            if($f.Dhcp){ $plan.Dhcp++ }
+            elseif($sAddr.Count -gt 0){
+                if($have.Dhcp -or (($have.Addresses -join ',') -ne ($sAddr -join ',')) -or (($have.Gateways -join ',') -ne ($sGw -join ','))){
+                    $plan.Changes += @{ Nic=$nic.Name; Index=$nic.InterfaceIndex; Family=$f.Family; Kind='ip'; Addresses=$sAddr; Gateways=$sGw; Text=("{0} {1}: static {2}{3}" -f $nic.Name,$f.Family,($sAddr -join ', '),$(if($sGw.Count){ " via $($sGw -join ', ')" }else{ '' })) }
+                } else { $plan.Same++ }
+            }
+            if($f.DnsStatic -and $sDns.Count -gt 0){
+                if(($have.Dns -join ',') -ne ($sDns -join ',')){ $plan.Changes += @{ Nic=$nic.Name; Index=$nic.InterfaceIndex; Family=$f.Family; Kind='dns'; Dns=$sDns; Text=("{0} {1}: DNS {2} (now {3})" -f $nic.Name,$f.Family,($sDns -join ', '),$(if($have.Dns.Count){ $have.Dns -join ', ' }else{ 'automatic' })) } }
+                else { $plan.Same++ }
+            }
+        }
+        if($s.DnsSuffix){
+            $curSuf=[string](Get-DnsClient -InterfaceIndex $nic.InterfaceIndex -ErrorAction SilentlyContinue).ConnectionSpecificSuffix
+            if($curSuf -ne [string]$s.DnsSuffix){ $plan.Changes += @{ Nic=$nic.Name; Index=$nic.InterfaceIndex; Family=''; Kind='suffix'; Suffix=[string]$s.DnsSuffix; Text=("{0}: DNS suffix {1}" -f $nic.Name,$s.DnsSuffix) } } else { $plan.Same++ }
+        }
+    }
+    $plan
+}
+
 function Invoke-ModuleBackup($id,$root){
     $meta  = $sync.Meta[$id]
     $entry = @{ Id=$id; Name=$meta.Name; Cat=$meta.Cat; Secure=[bool]$meta.Sensitive; Size=0; Status='ok'; Note=''; Paths=@() }
@@ -435,6 +479,19 @@ function Invoke-ModuleBackup($id,$root){
             if($out.Count -eq 0){ $entry.Status='skip'; $entry.Note='no adapters' }
             else { ($out | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $d 'netadapters.json') -Encoding UTF8; $entry.Paths=@('windows\netadapters.json'); $entry.Note="$($out.Count) adapters, $changed non-default settings" }
         }
+        'win_netip' {
+            $d = Join-Path $root 'windows'; EnsureDir $d; $out=@(); $static=0; $dnsStatic=0
+            try{
+                foreach($nic in @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue)){
+                    $fams=@()
+                    foreach($fam in 'IPv4','IPv6'){ $s=Get-NetIPState $nic $fam; if($s){ $fams+=$s; if(-not $s.Dhcp -and $s.Addresses.Count){ $static++ }; if($s.DnsStatic){ $dnsStatic++ } } }
+                    $dc=Get-DnsClient -InterfaceIndex $nic.InterfaceIndex -ErrorAction SilentlyContinue
+                    $out += @{ Name=$nic.Name; Description=$nic.InterfaceDescription; Mac=$nic.MacAddress; Families=$fams; DnsSuffix=[string]$dc.ConnectionSpecificSuffix }
+                }
+            }catch{}
+            if($out.Count -eq 0){ $entry.Status='skip'; $entry.Note='no adapters' }
+            else { ($out | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath (Join-Path $d 'netip.json') -Encoding UTF8; $entry.Paths=@('windows\netip.json'); $entry.Note="$($out.Count) adapters, $static static IP, $dnsStatic custom DNS" }
+        }
         'win_drives' {
             $d = Join-Path $root 'windows'; EnsureDir $d
             try{ $m=@(Get-SmbMapping -ErrorAction SilentlyContinue | Select-Object LocalPath,RemotePath); $m | Export-Csv (Join-Path $d 'drives.csv') -NoTypeInformation; $entry.Note="$($m.Count) drives" }catch{}
@@ -538,7 +595,7 @@ function Protect-Secure($root,$rels,$pw){
     foreach($rel in $rels){ $full=Join-Path $root $rel; if(Test-Path -LiteralPath $full){ Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
-$Script:MetaFiles=@('manifest.json','checksums.sha256','phoenix.log')
+$Script:MetaFiles=@('manifest.json','checksums.sha256','phoenix.log','compare.txt')
 function Write-Checksums($root){
     $files=@(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $Script:MetaFiles -notcontains $_.Name -or $_.DirectoryName -ne $root })
     $sb=New-Object System.Text.StringBuilder; $i=0; $ok=0; $n=[math]::Max(1,$files.Count); $Script:HashFails=0; $Script:HashLastError=''
@@ -561,10 +618,16 @@ function Start-BackupRun {
         if($prev.Count -gt 0){ $root=$prev[0].FullName; $sync.Mirror=$true; WL "Updating existing backup: $root" 'Info' } else { WL 'No previous backup found here - creating a new one.' 'Warn' }
     }
     if(-not $root){ $stamp = Get-Date -Format 'yyyyMMdd-HHmm'; $root = Join-Path $dest ("Phoenix-Backup-{0}-{1}" -f $env:COMPUTERNAME,$stamp) }
+    # Remember what we are about to overwrite / what came before, so the end report can say what changed since last time.
+    $prevSnap=$null; $prevRoot=$null; $prevLabel=$null
+    try{
+        if($sync.Mirror){ $prevSnap=Snapshot-BackupMeta $root; $prevLabel="previous run ($(([datetime](Get-Content (Join-Path $root 'manifest.json') -Raw | ConvertFrom-Json).Created).ToString('g')))" }
+        else { $prev=@(Get-ChildItem -LiteralPath $dest -Directory -Filter 'Phoenix-Backup-*' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $root -and (Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json')) } | Sort-Object Name -Descending); if($prev.Count -gt 0){ $prevRoot=$prev[0].FullName; $prevLabel=$prev[0].Name } }
+    }catch{ $prevSnap=$null; $prevRoot=$null }
     EnsureDir $root; $sync.OutputPath=$root; $sync.LogPath=Join-Path $root 'phoenix.log'
     if($sync.Mirror){ Remove-Item -LiteralPath (Join-Path $root 'secure') -Recurse -Force -ErrorAction SilentlyContinue }
     WL ("Phoenix backup started {0} on {1} ({2})" -f (Get-Date).ToString('g'),$env:COMPUTERNAME,$env:USERNAME)
-    $man = @{ Tool='Phoenix'; Version='1.1'; Machine=$env:COMPUTERNAME; User=$env:USERNAME; Created=(Get-Date).ToString('o'); Encrypted=[bool]$enc; Modules=@(); Log='phoenix.log' }
+    $man = @{ Tool='Phoenix'; Version='1.2'; Machine=$env:COMPUTERNAME; User=$env:USERNAME; Created=(Get-Date).ToString('o'); Encrypted=[bool]$enc; Modules=@(); Log='phoenix.log' }
     $total=$ids.Count; $i=0; $report=@()
     foreach($id in $ids){
         if($sync.Cancel){ WL 'Cancelled.' 'Warn'; break }
@@ -582,6 +645,13 @@ function Start-BackupRun {
     if(-not $sync.NoChecksums -and -not $sync.Cancel){ Prog 96 'Writing checksums...'; try{ $n=Write-Checksums $root; $man.Checksums='checksums.sha256'; WL "   checksums written for $n files" 'Ok' }catch{ WL "Checksums failed: $($_.Exception.Message)" 'Error'; $report += @{ Name='Checksums'; Status='error'; Note=$_.Exception.Message }; Remove-Item -LiteralPath (Join-Path $root 'checksums.sha256') -Force -ErrorAction SilentlyContinue } }
     $man.Completed=(Get-Date).ToString('o'); $man.Cancelled=[bool]$sync.Cancel
     ($man | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $root 'manifest.json') -Encoding UTF8
+    $cmpOld = if($prevSnap){ $prevSnap } elseif($prevRoot){ $prevRoot } else { $null }
+    if($cmpOld -and -not $sync.Cancel){
+        Prog 99 'Comparing with previous backup...'; WL "-> Changes since $prevLabel"
+        try{ $r=Compare-Backups $cmpOld $root $prevLabel (Split-Path $root -Leaf) ([bool]$prevSnap) $false; Write-CompareFile $root $r.Text | Out-Null; WL "   $($r.Summary)  -  details in compare.txt" $(if($r.Any){'Warn'}else{'Ok'}); $report += @{ Name='Changes since last backup'; Status=$(if($r.Any){'changed'}else{'ok'}); Note="$($r.Summary)  -  details in compare.txt" } }
+        catch{ WL "   compare skipped: $($_.Exception.Message)" 'Warn' }
+    }
+    if($prevSnap){ Remove-Item -LiteralPath $prevSnap -Recurse -Force -ErrorAction SilentlyContinue }
     Prog 100 'Backup complete'; WL "Saved to: $root" 'Ok'; $sync.Result='backup'
     Emit 'Report' @{ Title=$(if($sync.Cancel){'Backup cancelled'}else{'Backup complete'}); Items=$report }
 }
@@ -657,6 +727,38 @@ function Invoke-ModuleRestore($id,$src){
                 foreach($c in $plan.Changes){ try{ Set-NetAdapterAdvancedProperty -Name $c.Nic -RegistryKeyword $c.Keyword -RegistryValue $c.Value -NoRestart -ErrorAction Stop; $n++; WL "   $($c.Nic): $($c.DisplayName) -> $($c.DisplayValue)" }catch{ $fail++; WL "   $($c.Nic): $($c.DisplayName) failed: $($_.Exception.Message)" 'Warn' } }
                 foreach($nic in @($plan.Changes | ForEach-Object { $_.Nic } | Select-Object -Unique)){ try{ Restart-NetAdapter -Name $nic -ErrorAction SilentlyContinue }catch{} }
                 if($fail -gt 0){ Manual "$n applied, $fail failed (needs admin)" } elseif($plan.Changes.Count -eq 0){ Note 'all settings already match' } else { Note "$n settings applied on $(@($plan.Changes | ForEach-Object { $_.Nic } | Select-Object -Unique).Count) adapters" }
+            }
+        }
+        'win_netip' {
+            $f=P 'windows\netip.json'
+            if(Test-Path -LiteralPath $f){
+                $plan=Plan-NetIP $f
+                if($plan.Unmatched.Count -gt 0){ WL "   no matching adapter for: $($plan.Unmatched -join ', ')" 'Warn' }
+                $n=0; $fail=0
+                foreach($c in $plan.Changes){
+                    try{
+                        switch($c.Kind){
+                            'ip' {
+                                $pfx = if($c.Family -eq 'IPv4'){ '0.0.0.0/0' } else { '::/0' }
+                                Set-NetIPInterface -InterfaceIndex $c.Index -AddressFamily $c.Family -Dhcp Disabled -ErrorAction Stop
+                                Get-NetIPAddress -InterfaceIndex $c.Index -AddressFamily $c.Family -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+                                Get-NetRoute -InterfaceIndex $c.Index -AddressFamily $c.Family -DestinationPrefix $pfx -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                                $first=$true
+                                foreach($a in @($c.Addresses)){
+                                    $ip,$pl = $a -split '/'
+                                    $na=@{ InterfaceIndex=$c.Index; IPAddress=$ip; PrefixLength=[int]$pl; ErrorAction='Stop' }
+                                    if($first -and @($c.Gateways).Count -gt 0){ $na.DefaultGateway=@($c.Gateways)[0] }
+                                    New-NetIPAddress @na | Out-Null; $first=$false
+                                }
+                                foreach($g in @(@($c.Gateways) | Select-Object -Skip 1)){ New-NetRoute -InterfaceIndex $c.Index -DestinationPrefix $pfx -NextHop $g -ErrorAction SilentlyContinue | Out-Null }
+                            }
+                            'dns'    { Set-DnsClientServerAddress -InterfaceIndex $c.Index -ServerAddresses @($c.Dns) -ErrorAction Stop }
+                            'suffix' { Set-DnsClient -InterfaceIndex $c.Index -ConnectionSpecificSuffix $c.Suffix -ErrorAction Stop }
+                        }
+                        $n++; WL "   $($c.Text)"
+                    }catch{ $fail++; WL "   $($c.Text) failed: $($_.Exception.Message)" 'Warn' }
+                }
+                if($fail -gt 0){ Manual "$n applied, $fail failed (needs admin)" } elseif($plan.Changes.Count -eq 0){ Note "all settings already match ($($plan.Dhcp) DHCP adapters left alone)" } else { Note "$n settings applied ($($plan.Dhcp) DHCP adapters left alone)" }
             }
         }
         'win_hosts'   { $f=P 'windows\hosts'; if(Test-Path -LiteralPath $f){ try{ Copy-Item $f "$env:WINDIR\System32\drivers\etc\hosts" -Force -ErrorAction Stop }catch{ Manual 'hosts file needs admin - re-run elevated' } } }
@@ -864,6 +966,7 @@ function Start-DryRunRun {
                 'win_wifi' { $d=P 'windows\wifi'; if(Test-Path -LiteralPath $d){ $n=@(Get-ChildItem -LiteralPath $d -Filter *.xml).Count; $note="$n profiles to import"; if(-not $sync.IsAdmin){ $st='manual'; $note+=' (needs admin)' } } elseif($secureIds -contains 'win_wifi'){ $st='skip'; $note='in vault - password needed to inspect' } }
                 'win_power' { $d=P 'windows\power'; if(Test-Path -LiteralPath $d){ $note="$(@(Get-ChildItem -LiteralPath $d -Filter *.pow).Count) plans to import" } }
                 'win_netadapter' { $f=P 'windows\netadapters.json'; if(Test-Path -LiteralPath $f){ $plan=Plan-NetAdapter $f; foreach($c in $plan.Changes){ WL "   $($c.Nic): $($c.DisplayName) $($c.CurrentDisplay) -> $($c.DisplayValue)" }; $note="$($plan.Changes.Count) settings to change on $($plan.Matched) adapters, $($plan.Same) already match"; if($plan.Unmatched.Count -gt 0){ $note+="; no match for $($plan.Unmatched -join ', ')" }; if(-not $sync.IsAdmin){ $st='manual'; $note+=' (needs admin)' } } }
+                'win_netip' { $f=P 'windows\netip.json'; if(Test-Path -LiteralPath $f){ $plan=Plan-NetIP $f; foreach($c in $plan.Changes){ WL "   $($c.Text)" }; $note="$($plan.Changes.Count) changes on $($plan.Matched) adapters, $($plan.Same) already match, $($plan.Dhcp) DHCP (left alone)"; if($plan.Unmatched.Count -gt 0){ $note+="; no match for $($plan.Unmatched -join ', ')" }; if(-not $sync.IsAdmin -and $plan.Changes.Count -gt 0){ $st='manual'; $note+=' (needs admin)' } } }
                 'win_hosts' { $f=P 'windows\hosts'; if(Test-Path -LiteralPath $f){ $cur="$env:WINDIR\System32\drivers\etc\hosts"; $note = if(SameFile $f $cur){ 'identical to current hosts file' } else { 'will overwrite hosts file' }; if(-not $sync.IsAdmin){ $st='manual'; $note+=' (needs admin)' } } }
                 'win_tasks' { $d=P 'windows\tasks'; if(Test-Path -LiteralPath $d){ $note="$(@(Get-ChildItem -LiteralPath $d -Filter *.xml).Count) tasks to register"; if(-not $sync.IsAdmin){ $st='manual'; $note+=' (some need admin)' } } }
                 'win_explorer' { $note='will merge Explorer\Advanced registry values (sign out to apply)' }
@@ -887,6 +990,123 @@ function Start-DryRunRun {
     Emit 'Report' @{ Title='Dry run - what restore would do'; Items=$report }
 }
 
+# ---- Compare: what changed between two backups (module status/size, files via checksums, package/extension/env lists). ----
+$Script:CompareListFiles=@('apps\winget-packages.json','apps\installed-programs.csv','dev\vscode-extensions.txt','dev\vscode-insiders-extensions.txt','dev\cursor-extensions.txt','dev\npm-globals.json','dev\cargo-crates.txt','dev\dotnet-tools.txt','dev\env-user.json','dev\powershell\modules.json')
+# Keeps just the small list files + manifest + checksums so a mirror update can still be diffed against what it overwrote.
+function Snapshot-BackupMeta($root){
+    $snap=Join-Path $env:TEMP ('phx_prev_'+[Guid]::NewGuid().ToString('N'))
+    foreach($rel in (@('manifest.json','checksums.sha256') + $Script:CompareListFiles)){ $s=Join-Path $root $rel; if(Test-Path -LiteralPath $s){ $t=Join-Path $snap $rel; EnsureDir (Split-Path $t -Parent); Copy-Item -LiteralPath $s -Destination $t -Force } }
+    $pd=Join-Path $root 'dev\python'; if(Test-Path -LiteralPath $pd){ $t=Join-Path $snap 'dev\python'; EnsureDir $t; Get-ChildItem -LiteralPath $pd -Filter 'pip*.txt' | Copy-Item -Destination $t -Force }
+    $snap
+}
+# rel -> sha256 when checksums exist, else rel -> "L<length>" so presence/size can still be diffed. $null when a meta-only snapshot has no checksums.
+function Read-FileMap($root,$metaOnly){
+    $map=@{}; $cf=Join-Path $root 'checksums.sha256'
+    if(Test-Path -LiteralPath $cf){ foreach($line in (Get-Content -LiteralPath $cf -Encoding UTF8)){ if($line -match '^([0-9A-Fa-f]{64}) \*(.+)$'){ $map[$Matches[2]]=$Matches[1].ToLower() } }; return @{ Map=$map; Hashed=$true } }
+    if($metaOnly){ return $null }
+    foreach($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)){ if($f.DirectoryName -eq $root -and ($Script:MetaFiles -contains $f.Name -or $f.Name -like 'phoenix-restore-*.log')){ continue }; $map[(RelOf $root $f.FullName)]="L$($f.Length)" }
+    @{ Map=$map; Hashed=$false }
+}
+function Read-ListSets($root){
+    $sets=[ordered]@{}
+    $f=Join-Path $root 'apps\winget-packages.json'; if(Test-Path -LiteralPath $f){ try{ $sets['Apps (winget)']=@((Get-Content $f -Raw | ConvertFrom-Json).Sources | ForEach-Object { $_.Packages } | ForEach-Object { $_.PackageIdentifier }) }catch{} }
+    $f=Join-Path $root 'apps\installed-programs.csv'; if(Test-Path -LiteralPath $f){ try{ $sets['Installed programs']=@(Import-Csv $f | ForEach-Object { "$($_.Name) $($_.Version)".Trim() }) }catch{} }
+    foreach($pair in @(@('vscode','VS Code extensions'),@('vscode-insiders','VS Code Insiders extensions'),@('cursor','Cursor extensions'))){ $f=Join-Path $root "dev\$($pair[0])-extensions.txt"; if(Test-Path -LiteralPath $f){ $sets[$pair[1]]=@(Get-Content $f | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } }
+    $f=Join-Path $root 'dev\npm-globals.json'; if(Test-Path -LiteralPath $f){ try{ $j=Get-Content $f -Raw | ConvertFrom-Json; $sets['npm globals']=@($j.dependencies.PSObject.Properties | ForEach-Object { "$($_.Name)@$($_.Value.version)" }) }catch{} }
+    $pd=Join-Path $root 'dev\python'; if(Test-Path -LiteralPath $pd){ foreach($pf in (Get-ChildItem -LiteralPath $pd -Filter 'pip*.txt')){ $sets["pip ($($pf.BaseName))"]=@(Get-Content $pf.FullName | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } }
+    $f=Join-Path $root 'dev\cargo-crates.txt'; if(Test-Path -LiteralPath $f){ $sets['cargo crates']=@(Get-Content $f | ForEach-Object { if($_ -match '^(\S+\s+v\S+)'){ $Matches[1] } }) }
+    $f=Join-Path $root 'dev\dotnet-tools.txt'; if(Test-Path -LiteralPath $f){ $sets['dotnet tools']=@(Get-Content $f | Select-Object -Skip 2 | ForEach-Object { (($_ -split '\s+') | Select-Object -First 2) -join ' ' } | Where-Object { $_.Trim() }) }
+    $f=Join-Path $root 'dev\powershell\modules.json'; if(Test-Path -LiteralPath $f){ try{ $sets['PowerShell modules']=@(Get-Content $f -Raw | ConvertFrom-Json | ForEach-Object { "$($_.Name) $($_.Version)" }) }catch{} }
+    $f=Join-Path $root 'dev\env-user.json'
+    if(Test-Path -LiteralPath $f){ try{ $j=Get-Content $f -Raw | ConvertFrom-Json; $vars=@(); $path=@(); foreach($p in $j.PSObject.Properties){ if($p.Name -eq 'Path'){ $path=@([string]$p.Value -split ';' | Where-Object { $_ }) } else { $vars+="$($p.Name)=$($p.Value)" } }; $sets['Environment variables']=$vars; $sets['PATH entries']=$path }catch{} }
+    $sets
+}
+function Diff-Sets($a,$b){ $ha=@{}; foreach($x in $a){ $ha[$x]=$true }; $hb=@{}; foreach($x in $b){ $hb[$x]=$true }; @{ Added=@($b | Where-Object { -not $ha[$_] }); Removed=@($a | Where-Object { -not $hb[$_] }) } }
+function Group-Of($rel,$modPaths){ $best=$null; foreach($p in $modPaths.Keys){ if(($rel -eq $p -or $rel.StartsWith($p+'\')) -and ($null -eq $best -or $p.Length -gt $best.Length)){ $best=$p } }; if($best){ $modPaths[$best] } else { '(other)' } }
+
+function Compare-Backups($oldRoot,$newRoot,$oldLabel,$newLabel,$metaOnly,$showProgress){
+    $report=@(); $txt=New-Object System.Text.StringBuilder
+    $null=$txt.AppendLine("Phoenix compare:  $oldLabel  ->  $newLabel"); $null=$txt.AppendLine("Generated $((Get-Date).ToString('g')) on $env:COMPUTERNAME"); $null=$txt.AppendLine()
+    $mo=Get-Content (Join-Path $oldRoot 'manifest.json') -Raw | ConvertFrom-Json
+    $mn=Get-Content (Join-Path $newRoot 'manifest.json') -Raw | ConvertFrom-Json
+
+    if($showProgress){ Prog 10 'Comparing modules...' }
+    $null=$txt.AppendLine('== Modules =='); $changedMods=0
+    $oldMods=@{}; foreach($m in @($mo.Modules)){ $oldMods[$m.Id]=$m }; $newMods=@{}; foreach($m in @($mn.Modules)){ $newMods[$m.Id]=$m }
+    $modPaths=@{}; foreach($m in (@($mn.Modules)+@($mo.Modules))){ foreach($p in (@($m.Paths)+@($m.SecurePaths))){ if($p -and -not $modPaths.ContainsKey($p)){ $modPaths[$p]=$m.Name } } }
+    $allIds=@(@($oldMods.Keys)+@($newMods.Keys) | Select-Object -Unique)
+    foreach($id in $allIds){
+        $o=$oldMods[$id]; $n=$newMods[$id]; $name= if($n){ $n.Name } else { $o.Name }
+        if(-not $o){ $null=$txt.AppendLine("  + $name  (new: $($n.Status), $(Fmt-Bytes $n.Size))"); $changedMods++; continue }
+        if(-not $n){ $null=$txt.AppendLine("  - $name  (no longer backed up)"); $changedMods++; continue }
+        $delta=[long]$n.Size-[long]$o.Size
+        if($o.Status -ne $n.Status -or $delta -ne 0 -or [string]$o.Note -ne [string]$n.Note){
+            $changedMods++
+            $parts=@(); if($o.Status -ne $n.Status){ $parts+="$($o.Status) -> $($n.Status)" }; if($delta -ne 0){ $parts+=("size {0}{1}" -f $(if($delta -gt 0){'+'}else{'-'}),(Fmt-Bytes ([math]::Abs($delta)))) }; if([string]$o.Note -ne [string]$n.Note){ $parts+="'$($o.Note)' -> '$($n.Note)'" }
+            $null=$txt.AppendLine("  ~ $name  $($parts -join '  ')")
+        }
+    }
+    if($changedMods -eq 0){ $null=$txt.AppendLine('  no changes') }
+    $report += @{ Name='Modules'; Status=$(if($changedMods){'changed'}else{'ok'}); Note="$changedMods of $($allIds.Count) modules changed (status, size or note)" }
+
+    if($showProgress){ Prog 30 'Comparing files...' }
+    $null=$txt.AppendLine(); $null=$txt.AppendLine('== Files ==')
+    $fo=Read-FileMap $oldRoot $metaOnly; $fn=Read-FileMap $newRoot $false
+    $added=@(); $removed=@(); $changed=@(); $same=0
+    if($null -eq $fo){ $null=$txt.AppendLine('  previous run had no checksums - file-level diff not available'); $report += @{ Name='Files'; Status='skip'; Note='previous backup had no checksums' } }
+    else {
+        $contentCmp = ($fo.Hashed -eq $fn.Hashed)
+        foreach($k in $fn.Map.Keys){ if($k -like 'secure\*'){ continue }; if(-not $fo.Map.ContainsKey($k)){ $added+=$k } elseif($contentCmp -and $fo.Map[$k] -ne $fn.Map[$k]){ $changed+=$k } else { $same++ } }
+        foreach($k in $fo.Map.Keys){ if($k -like 'secure\*'){ continue }; if(-not $fn.Map.ContainsKey($k)){ $removed+=$k } }
+        $groups=[ordered]@{}
+        foreach($pair in @(@('+',$added),@('-',$removed),@('~',$changed))){ foreach($k in $pair[1]){ $g=Group-Of $k $modPaths; if(-not $groups.Contains($g)){ $groups[$g]=@{ '+'=@(); '-'=@(); '~'=@() } }; $groups[$g][$pair[0]] += $k } }
+        foreach($g in $groups.Keys){
+            $gg=$groups[$g]
+            $null=$txt.AppendLine(("  {0}: +{1} -{2} ~{3}" -f $g,$gg['+'].Count,$gg['-'].Count,$gg['~'].Count))
+            foreach($sym in '+','-','~'){ foreach($k in ($gg[$sym] | Select-Object -First 40)){ $null=$txt.AppendLine("     $sym $k") }; if($gg[$sym].Count -gt 40){ $null=$txt.AppendLine("     $sym ... and $($gg[$sym].Count-40) more") } }
+            $report += @{ Name=$g; Status='changed'; Note=("+{0} added, -{1} removed, {2} changed" -f $gg['+'].Count,$gg['-'].Count,$gg['~'].Count) }
+            WL ("   {0}: +{1} -{2} ~{3} files" -f $g,$gg['+'].Count,$gg['-'].Count,$gg['~'].Count)
+        }
+        if($groups.Count -eq 0){ $null=$txt.AppendLine('  no file changes') }
+        $how = if(-not $contentCmp){ ' (presence only - one side has no checksums)' } elseif(-not $fn.Hashed){ ' (by size - no checksums)' } else { '' }
+        if(Test-Path -LiteralPath (Join-Path $newRoot 'secure\vault.enc')){ $null=$txt.AppendLine('  encrypted vault not compared') }
+        $report += @{ Name='Files'; Status=$(if($added.Count+$removed.Count+$changed.Count){'changed'}else{'ok'}); Note=("+{0} added, -{1} removed, {2} changed, {3} unchanged{4}" -f $added.Count,$removed.Count,$changed.Count,$same,$how) }
+    }
+
+    if($showProgress){ Prog 70 'Comparing package & extension lists...' }
+    $null=$txt.AppendLine(); $null=$txt.AppendLine('== Lists ==')
+    $lo=Read-ListSets $oldRoot; $ln=Read-ListSets $newRoot; $listChanges=0
+    foreach($name in @(@($lo.Keys)+@($ln.Keys) | Select-Object -Unique)){
+        if(-not $lo.Contains($name) -or -not $ln.Contains($name)){ $side= if($ln.Contains($name)){ 'new' } else { 'old' }; $null=$txt.AppendLine("  $name : only in $side backup"); $report += @{ Name=$name; Status='skip'; Note="only in the $side backup" }; continue }
+        $d=Diff-Sets $lo[$name] $ln[$name]
+        if($d.Added.Count -eq 0 -and $d.Removed.Count -eq 0){ $report += @{ Name=$name; Status='ok'; Note="unchanged ($(@($ln[$name]).Count) entries)" }; continue }
+        $listChanges += $d.Added.Count + $d.Removed.Count
+        $null=$txt.AppendLine("  $name : +$($d.Added.Count) -$($d.Removed.Count)"); foreach($x in $d.Added){ $null=$txt.AppendLine("     + $x") }; foreach($x in $d.Removed){ $null=$txt.AppendLine("     - $x") }
+        foreach($x in ($d.Added | Select-Object -First 10)){ WL "   $name  + $x" }; foreach($x in ($d.Removed | Select-Object -First 10)){ WL "   $name  - $x" }
+        if($d.Added.Count + $d.Removed.Count -gt 20){ WL "   $name  ... see compare.txt for the full list" }
+        $report += @{ Name=$name; Status='changed'; Note="+$($d.Added.Count) added, -$($d.Removed.Count) removed" }
+    }
+    if($lo.Count -eq 0 -and $ln.Count -eq 0){ $null=$txt.AppendLine('  no list files in either backup') }
+
+    $summary = "{0} modules, +{1}/-{2}/~{3} files, {4} list entries changed" -f $changedMods,$added.Count,$removed.Count,$changed.Count,$listChanges
+    @{ Report=$report; Text=$txt.ToString(); Summary=$summary; Any=(($changedMods + $added.Count + $removed.Count + $changed.Count + $listChanges) -gt 0) }
+}
+function Write-CompareFile($root,$text){ try{ [IO.File]::WriteAllText((Join-Path $root 'compare.txt'),$text,(New-Object System.Text.UTF8Encoding($false))); $true }catch{ WL "   could not write compare.txt: $($_.Exception.Message)" 'Warn'; $false } }
+
+function Start-CompareRun {
+    $a=$sync.CompareA; $b=$sync.CompareB
+    $ma=Get-Content (Join-Path $a 'manifest.json') -Raw | ConvertFrom-Json; $mb=Get-Content (Join-Path $b 'manifest.json') -Raw | ConvertFrom-Json
+    if([datetime]$ma.Created -gt [datetime]$mb.Created){ $t=$a; $a=$b; $b=$t }
+    $la=Split-Path $a -Leaf; $lb=Split-Path $b -Leaf
+    WL "Older: $a"; WL "Newer: $b"
+    $r=Compare-Backups $a $b $la $lb $false $true
+    if(Write-CompareFile $b $r.Text){ WL "   details written to $(Join-Path $b 'compare.txt')" 'Ok' }
+    WL "   $($r.Summary)" $(if($r.Any){'Warn'}else{'Ok'})
+    $sync.OutputPath=$b; $sync.Result='compare'
+    Prog 100 'Compare complete'
+    Emit 'Report' @{ Title="Changes: $la  ->  $lb"; Items=$r.Report }
+}
+
 try{
     switch($sync.Op){
         'Backup'   { Start-BackupRun }
@@ -894,6 +1114,7 @@ try{
         'Estimate' { Start-EstimateRun }
         'Verify'   { Start-VerifyRun }
         'DryRun'   { Start-DryRunRun }
+        'Compare'  { Start-CompareRun }
     }
 }catch{ WL $_.Exception.Message 'Error' }
 finally{ Emit 'Done' @{} }
@@ -1241,6 +1462,7 @@ $Xaml = @'
                   <TextBlock x:Name="LblVaultHint" Text="" Foreground="{StaticResource Warn}" FontSize="12" VerticalAlignment="Center" Margin="10,0,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Column="2" Orientation="Horizontal">
+                  <Button x:Name="BtnCompare" Style="{StaticResource Ghost}" Margin="0,0,10,0" IsEnabled="False" ToolTip="Compare this backup with another one: modules, files and package/extension lists added, removed or changed."><StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Icon}" Text="&#xE8AB;" FontSize="13"/><TextBlock Text="Compare" Margin="6,0,0,0"/></StackPanel></Button>
                   <Button x:Name="BtnVerify" Style="{StaticResource Ghost}" Margin="0,0,10,0" IsEnabled="False" ToolTip="Re-hash every file against checksums.sha256 and check the vault."><StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Icon}" Text="&#xE73E;" FontSize="13"/><TextBlock Text="Verify" Margin="6,0,0,0"/></StackPanel></Button>
                   <Button x:Name="BtnDryRun" Style="{StaticResource Ghost}" Margin="0,0,10,0" IsEnabled="False" ToolTip="Show what restore would change on this PC without touching anything."><StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Icon}" Text="&#xE8FD;" FontSize="13"/><TextBlock Text="Dry run" Margin="6,0,0,0"/></StackPanel></Button>
                   <Button x:Name="BtnStartRestore" Style="{StaticResource Primary}" Width="170" IsEnabled="False"><StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Icon}" Text="&#xE7B8;" FontSize="14"/><TextBlock Text="Start restore" Margin="8,0,0,0"/></StackPanel></Button>
@@ -1329,6 +1551,8 @@ $window  = [Windows.Markup.XamlReader]::Load($reader)
 function C($n){ $window.FindName($n) }
 
 $Script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# Phoenix.exe sets PHOENIX_EXE so relaunch-as-admin and scheduled tasks point back at the exe instead of Phoenix.cmd.
+$Script:Launcher = if($env:PHOENIX_EXE -and (Test-Path -LiteralPath $env:PHOENIX_EXE)){ $env:PHOENIX_EXE } else { Join-Path $PSScriptRoot 'Phoenix.cmd' }
 if($Script:IsAdmin){ (C 'AdminBadge').Visibility='Visible' } else { (C 'BtnElevate').Visibility='Visible' }
 #endregion
 
@@ -1451,7 +1675,7 @@ function Show-Overlay($title){
 }
 function Show-Report($title,$items){
     $panel=C 'OvReportPanel'; $panel.Children.Clear()
-    $counts=@{ ok=0; manual=0; skip=0; error=0 }
+    $counts=@{ ok=0; manual=0; skip=0; error=0; changed=0 }
     foreach($it in @($items)){
         $st=[string]$it.Status; if(-not $counts.ContainsKey($st)){ $st='ok' }; $counts[$st]++
         $row=New-Object System.Windows.Controls.Grid; $row.Margin='0,4,0,4'
@@ -1463,6 +1687,7 @@ function Show-Report($title,$items){
             'manual' { $ic.Text=[char]0xE7BA; $ic.Foreground=$window.FindResource('Warn') }
             'skip'   { $ic.Text=[char]0xE738; $ic.Foreground=$window.FindResource('Muted') }
             'error'  { $ic.Text=[char]0xEA39; $ic.Foreground=$window.FindResource('Bad') }
+            'changed'{ $ic.Text=[char]0xE8AB; $ic.Foreground=$window.FindResource('Accent') }
         }
         $sp=New-Object System.Windows.Controls.StackPanel
         $n=New-Object System.Windows.Controls.TextBlock; $n.Text=[string]$it.Name; $n.FontWeight='SemiBold'; $n.FontSize=13
@@ -1472,7 +1697,7 @@ function Show-Report($title,$items){
         $row.Children.Add($ic) | Out-Null; $row.Children.Add($sp) | Out-Null
         $panel.Children.Add($row) | Out-Null
     }
-    (C 'OvSummary').Text = ("{0} ok  -  {1} need attention  -  {2} skipped  -  {3} failed" -f $counts.ok,$counts.manual,$counts.skip,$counts.error)
+    (C 'OvSummary').Text = if($title -like 'Changes:*'){ ("{0} unchanged  -  {1} changed  -  {2} not comparable" -f $counts.ok,$counts.changed,$counts.skip) } else { ("{0} ok  -  {1} need attention  -  {2} skipped  -  {3} failed" -f $counts.ok,$counts.manual,$counts.skip,$counts.error) }
     (C 'OvTitle').Text=$title
     (C 'OvReport').Visibility='Visible'; (C 'OvLog').Visibility='Collapsed'
     (C 'BtnToggleLog').Visibility='Visible'; (C 'TxtToggleLog').Text='Show log'
@@ -1565,7 +1790,7 @@ $Script:Timer.Add_Tick({
             'Done' {
                 $Script:Timer.Stop()
                 (C 'BtnCancelOp').Visibility='Collapsed'; (C 'BtnCloseOv').Visibility='Visible'
-                if($Script:sync.Result -eq 'backup' -and $Script:sync.OutputPath){ (C 'BtnOpenFolder').Visibility='Visible'; $Script:LastOutput=$Script:sync.OutputPath }
+                if(($Script:sync.Result -eq 'backup' -or $Script:sync.Result -eq 'compare') -and $Script:sync.OutputPath){ (C 'BtnOpenFolder').Visibility='Visible'; $Script:LastOutput=$Script:sync.OutputPath }
                 if($Script:sync.Op -eq 'Estimate'){ (C 'Overlay').Visibility='Collapsed' }
                 elseif(-not $Script:ReportShown){ (C 'OvTitle').Text = if($Script:sync.Result -eq 'error'){'Finished with errors'} else {'All done'} }
                 if($Script:PSInstance){ try{ $Script:PSInstance.EndInvoke($Script:PSHandle) }catch{}; $Script:PSInstance.Dispose(); $Script:PSInstance=$null }
@@ -1597,7 +1822,7 @@ function Start-Worker($op){
 (C 'BtnMin').Add_Click({ $window.WindowState='Minimized' })
 (C 'BtnClose').Add_Click({ $window.Close() })
 (C 'BtnElevate').Add_Click({
-    try{ Start-Process (Join-Path $PSScriptRoot 'Phoenix.cmd') -Verb RunAs; $window.Close() }catch{}
+    try{ Start-Process $Script:Launcher -Verb RunAs; $window.Close() }catch{}
 })
 
 function Set-Nav($active){
@@ -1665,10 +1890,10 @@ function Set-Dest($p){ $Script:Dest=$p; (C 'TxtDest').Text=$p; (C 'TxtDest').For
     }
     try{
         $trigger = if($r -eq 'Yes'){ New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '20:00' } else { New-ScheduledTaskTrigger -Daily -At '20:00' }
-        $action  = New-ScheduledTaskAction -Execute (Join-Path $PSScriptRoot 'Phoenix.cmd') -Argument $args -WorkingDirectory $PSScriptRoot
+        $action  = New-ScheduledTaskAction -Execute $Script:Launcher -Argument $args -WorkingDirectory (Split-Path $Script:Launcher -Parent)
         $settings= New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 6) -MultipleInstances IgnoreNew
         Register-ScheduledTask -TaskName 'Phoenix Backup' -Action $action -Trigger $trigger -Settings $settings -Description 'Phoenix - Windows Migration Kit: scheduled headless backup' -Force | Out-Null
-        [System.Windows.MessageBox]::Show("Task 'Phoenix Backup' created. Keep this Phoenix folder where it is - the task runs Phoenix.cmd from here.",'Phoenix') | Out-Null
+        [System.Windows.MessageBox]::Show("Task 'Phoenix Backup' created. Keep $(Split-Path $Script:Launcher -Leaf) where it is - the task runs it from:`n$(Split-Path $Script:Launcher -Parent)",'Phoenix') | Out-Null
     }catch{ [System.Windows.MessageBox]::Show("Could not create the task: $($_.Exception.Message)",'Phoenix') | Out-Null }
 })
 
@@ -1717,6 +1942,7 @@ function Load-Manifest($folder){
     (C 'BtnStartRestore').IsEnabled = ($Script:RestoreChecks.Count -gt 0)
     (C 'BtnDryRun').IsEnabled = ($Script:RestoreChecks.Count -gt 0)
     (C 'BtnVerify').IsEnabled = $true
+    (C 'BtnCompare').IsEnabled = $true
     if($hasVault){ (C 'PwRestoreWrap').Visibility='Visible'; (C 'LblVaultHint').Text='Vault password needed for sensitive items' }
     else { (C 'PwRestoreWrap').Visibility='Collapsed'; (C 'LblVaultHint').Text='' }
     $Script:ManifestHasVault=$hasVault
@@ -1734,6 +1960,19 @@ function Get-RestoreIds { $ids=@(); foreach($k in $Script:RestoreChecks.Keys){ i
     $Script:sync.RestoreSrc=$Script:Src; $Script:sync.Password=(C 'PwdRestore').Password
     Show-Overlay 'Verifying backup...'
     Start-Worker 'Verify'
+})
+
+(C 'BtnCompare').Add_Click({
+    if(-not $Script:Src){ return }
+    $dlg=New-Object System.Windows.Forms.FolderBrowserDialog; $dlg.Description='Pick the other Phoenix backup to compare with'
+    $dlg.SelectedPath=Split-Path $Script:Src -Parent
+    if($dlg.ShowDialog() -ne 'OK'){ return }
+    $other=$dlg.SelectedPath
+    if($other.TrimEnd('\') -ieq $Script:Src.TrimEnd('\')){ [System.Windows.MessageBox]::Show('Pick a different backup than the one already open.','Phoenix') | Out-Null; return }
+    if(-not (Test-Path -LiteralPath (Join-Path $other 'manifest.json'))){ [System.Windows.MessageBox]::Show('No manifest.json in that folder. Pick a Phoenix-Backup-... folder.','Phoenix') | Out-Null; return }
+    $Script:sync.CompareA=$Script:Src; $Script:sync.CompareB=$other
+    Show-Overlay 'Comparing backups...'
+    Start-Worker 'Compare'
 })
 
 (C 'BtnDryRun').Add_Click({

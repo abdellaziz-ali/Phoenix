@@ -11,6 +11,10 @@ my-apps.json
 *.pow
 *.reg
 
+# ---- Build output (Phoenix.exe goes on Releases) ----
+dist/
+*.exe
+
 # ---- OS / editor noise ----
 Thumbs.db
 ehthumbs.db
