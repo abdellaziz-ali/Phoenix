@@ -38,10 +38,6 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 - 🖥️ **Responsive UI** — work runs on a background runspace, so the window never freezes; live log + progress.
 - 📦 **Zero dependencies** — runs on the Windows PowerShell 5.1 that ships with every Windows 10/11.
 
-## Screenshots
-
-> *Add screenshots of the Backup and Restore screens here (e.g. `docs/backup.png`, `docs/restore.png`).*
-
 ---
 
 ## Requirements
