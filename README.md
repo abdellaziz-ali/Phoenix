@@ -27,12 +27,14 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 
 ## Highlights
 
-- 🎛️ **Pick exactly what to save** — ~28 modules across 5 categories with a checkbox tree and Minimal / Developer / Everything presets.
-- 🔐 **AES-256 encrypted vault** (PBKDF2, 200k iterations) for sensitive items like SSH keys, Wi-Fi passwords and PuTTY sessions — everything else stays browsable.
+- 🎛️ **Pick exactly what to save** — ~35 modules across 5 categories with a checkbox tree and Minimal / Developer / Everything presets, plus a per-app AppData picker and custom folders.
+- 🔐 **AES-256 encrypted vault** (PBKDF2-SHA256, 200k iterations, HMAC-SHA256 integrity) for sensitive items like SSH keys, Wi-Fi passwords, browser profiles and PuTTY sessions — everything else stays browsable.
 - 🧠 **Smart mode** copies app configs but skips caches, chat history and other regenerated junk (keeps a VS Code backup at ~1 MB instead of gigabytes).
-- 🧾 **`manifest.json`** records every item, its size, status and notes — restore reads it back and shows exactly what's inside.
-- 🛟 **Creates a System Restore Point** before writing any Windows settings on restore.
-- ♻️ **Auto-reinstalls** apps, editor extensions and language globals (npm / cargo / dotnet) on the new PC.
+- 🧾 **`manifest.json` + `checksums.sha256` + `phoenix.log`** — every item, its size, status and hash. **Verify** re-hashes the backup any time.
+- 🔍 **Dry run** — shows exactly what restore would install, overwrite or skip on *this* PC before touching anything.
+- 🛟 **Creates a System Restore Point** before writing any Windows settings on restore, and ends with a per-item **report** (done / skipped / needs manual action).
+- ♻️ **Auto-reinstalls** apps, editor extensions, language globals (npm / pip / cargo / dotnet / PowerShell modules) and even **WSL distros** on the new PC.
+- ⏰ **Scheduled backups** — one click creates a Windows task that runs Phoenix headless and mirror-updates the existing backup.
 - 🖥️ **Responsive UI** — work runs on a background runspace, so the window never freezes; live log + progress.
 - 📦 **Zero dependencies** — runs on the Windows PowerShell 5.1 that ships with every Windows 10/11.
 
@@ -61,14 +63,16 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 1. **Backup** tab → choose a **destination** (your USB / D: / OneDrive).
 2. Pick a **preset** or tick individual items. Optionally tick **Encrypt sensitive** and set a password.
 3. *(Optional)* **Estimate size** to preview how big it'll be.
-4. **Start backup.** You get a folder like `Phoenix-Backup-PCNAME-20260929-0127` containing `manifest.json` and your data.
+4. **Start backup.** You get a folder like `Phoenix-Backup-PCNAME-20260929-0127` containing `manifest.json`, `checksums.sha256`, `phoenix.log` and your data.
+5. *(Optional)* **Schedule** to create a Windows task that re-runs the same selection automatically and mirror-updates that folder.
 
 ### Restore (on the fresh install)
 
 1. Copy the `Phoenix` folder back and run **`Phoenix.cmd`** (right-click → **Run as administrator** for a complete restore).
 2. **Restore** tab → **Open backup** → select your `Phoenix-Backup-…` folder.
 3. Phoenix reads the manifest and shows what's inside. Untick anything you don't want. Enter the vault password if you encrypted.
-4. **Start restore.** It creates a restore point, reinstalls apps, and puts your settings and files back.
+4. **Verify** to make sure the backup is intact, then **Dry run** to see what would change on this PC.
+5. **Start restore.** It creates a restore point, reinstalls apps, puts your settings and files back, and shows a report of anything that needs a manual step.
 
 > Sign out / restart afterwards so Explorer, environment variables and Windows Terminal pick up the changes.
 
@@ -78,11 +82,11 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 
 | Category | Modules |
 | --- | --- |
-| **Applications** | Installed apps (winget export/import), UniGetUI `.ubundle` |
-| **Developer environment** | VS Code / Insiders / Cursor extensions · global npm packages (+ nvm/fnm) · pip freeze per Python · Rust toolchains & cargo crates · dotnet global tools · Git config · **SSH keys** 🔒 · PowerShell profile & modules · WSL distro list · user environment variables (incl. PATH) |
-| **Windows settings** | **Wi‑Fi profiles + passwords** 🔒 · power plans · mapped drives · hosts file · scheduled tasks · Explorer/taskbar tweaks · Windows Terminal · printers · default app associations · user-installed fonts |
-| **App settings & data** | App configs (Smart, caches skipped) · **PuTTY sessions** 🔒 |
-| **User folders** | Documents · Desktop · Pictures · Downloads · Videos · Music |
+| **Applications** | Installed apps (winget export/import) · UniGetUI `.ubundle` · full **installed-programs inventory** (Add/Remove Programs, incl. non-winget) as a reinstall checklist |
+| **Developer environment** | VS Code / Insiders / Cursor extensions · global npm packages (+ nvm/fnm) · pip freeze per Python · Rust toolchains & cargo crates · dotnet global tools · Git config (credentials 🔒) · **SSH keys** 🔒 · PowerShell profile & modules · WSL distro list · **WSL full export/import** (`wsl --export`) · user environment variables (incl. PATH) |
+| **Windows settings** | **Wi‑Fi profiles + passwords** 🔒 · power plans · **network adapter driver settings** (Speed & Duplex, Jumbo Packet, Wake‑on‑LAN, RSS…) · mapped drives · hosts file · scheduled tasks (with folders) · Explorer/taskbar tweaks · Windows Terminal (Store *and* unpackaged) · printers · default app associations · user-installed fonts (copied *and* registered) |
+| **App settings & data** | App configs (Smart, caches skipped — pick which apps) · **browser bookmarks** (Chrome, Edge, Brave, Vivaldi, Firefox) · **full browser profiles** 🔒 · **PuTTY sessions** 🔒 |
+| **User folders** | Documents · Desktop · Pictures · Downloads · Videos · Music · **any custom folders** you add (game saves, notes vault, projects…) |
 
 🔒 = routed into the encrypted vault when **Encrypt sensitive** is on.
 
@@ -90,16 +94,18 @@ sessions, scheduled tasks, and more — behind a clean, modern UI.
 
 ## Security
 
-- Sensitive modules are collected, zipped and encrypted into `secure/vault.enc` using **AES-256-CBC** with a key derived from your password via **PBKDF2 (SHA-1, 200,000 iterations)**. A random salt and IV are generated per backup and stored in the file header.
+- Sensitive modules are collected, zipped and encrypted into `secure/vault.enc` using **AES-256-CBC** with keys derived from your password via **PBKDF2-SHA256 (200,000 iterations)**. An **HMAC-SHA256** tag over the ciphertext (encrypt-then-MAC) means a wrong password or a corrupted file is detected *before* anything is decrypted. A random salt and IV are generated per backup and stored in the file header (`PHX2` format; v1.0 vaults still open).
 - With encryption **off**, sensitive data is still saved but **in plaintext** — the app warns you in the log. On removable media, always encrypt.
-- Nothing is uploaded anywhere. Phoenix has no network calls of its own; the only outbound activity is `winget` downloading your apps during restore.
-- The vault password is never written to disk. If you lose it, the vault cannot be recovered.
+- Every file's SHA-256 is recorded in `checksums.sha256`; **Verify** re-hashes the backup and checks the vault tag.
+- Nothing is uploaded anywhere. Phoenix has no network calls of its own; the only outbound activity is `winget` / `pip` / `npm` / `cargo` downloading your packages during restore.
+- The vault password is never written to disk. For scheduled encrypted backups it's read from the `PHOENIX_VAULT_PASSWORD` environment variable. If you lose it, the vault cannot be recovered.
 
 ## Administrator
 
 Most items work as a normal user. Run **as administrator** for:
 
 - Wi‑Fi profile import (`user=all`)
+- Network adapter driver settings (`Set-NetAdapterAdvancedProperty`)
 - Scheduled task registration
 - Default app associations export/import
 - Writing the `hosts` file
@@ -120,23 +126,30 @@ The title bar shows an **Administrator** badge, or a **Run as admin** button to 
 ```text
 Phoenix-Backup-<PC>-<timestamp>/
 ├─ manifest.json
-├─ apps/           winget-packages.json, apps.ubundle
-├─ dev/            extensions, npm/pip/cargo/dotnet lists, git, env, ssh…
-├─ windows/        wifi, power, hosts, tasks, terminal, explorer.reg…
-├─ appdata/        per-app Smart configs
-├─ userfolders/    Documents, Desktop, …
-└─ secure/vault.enc  (encrypted sensitive bundle)
+├─ checksums.sha256   SHA-256 of every file (used by Verify)
+├─ phoenix.log        full log of the run
+├─ apps/              winget-packages.json, apps.ubundle, installed-programs.csv
+├─ dev/               extensions, npm/pip/cargo/dotnet lists, git, env, ssh, wsl/*.tar…
+├─ windows/           wifi, power, netadapters.json, hosts, tasks, terminal, explorer.reg…
+├─ appdata/           per-app Smart configs, browsers/bookmarks, browsers/profiles
+├─ userfolders/       Documents, Desktop, …, custom/
+└─ secure/vault.enc   (encrypted sensitive bundle)
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] Optional full **WSL distro export** (`wsl --export`)
-- [ ] Browser profile/bookmark capture
-- [ ] Scheduled/automated backups
-- [ ] Per-app AppData picker with live sizes
-- [ ] Restore "dry run" diff against the current PC
+- [x] Full **WSL distro export** (`wsl --export`)
+- [x] Browser profile/bookmark capture
+- [x] Scheduled/automated backups
+- [x] Per-app AppData picker with live sizes + custom folders
+- [x] Restore "dry run" diff against the current PC
+- [x] Backup verification (checksums + vault integrity)
+- [x] Network adapter driver settings
+- [ ] Static IP / DNS configuration per adapter
+- [ ] Compare two backups (what changed since last run)
+- [ ] Portable single `.exe` wrapper
 
 ## Contributing
 
